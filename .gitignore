@@ -8,5 +8,5 @@ arb.log
 *.tmp
 
 # tracked: index.html + source (.py) + the workflow.
-# ids_cache.json + vol_cache.json are committed (force-added by CI) so a normal hourly
-# run only hits Fuzzwork (no ESI / SDE re-fetch).
+# ids_cache.json + vol_cache.json + routes_cache.json are committed (force-added by CI) so a
+# normal hourly run only hits Fuzzwork (no ESI ids / SDE volume / ESI route re-fetch).

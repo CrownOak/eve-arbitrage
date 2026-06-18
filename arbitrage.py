@@ -29,8 +29,14 @@ ESI = "https://esi.evetech.net/latest/universe/ids/?datasource=tranquility"
 # flagged enhancement, not a v1 dependency).
 HUBS = [("Jita", 10000002), ("Amarr", 10000043), ("Dodixie", 10000032),
         ("Rens", 10000030), ("Hek", 10000042)]
+# Solar system IDs of the hub systems (for ESI /route jump distances; static, hubs do not move).
+HUB_SYSTEMS = {"Jita": 30000142, "Amarr": 30002187, "Dodixie": 30002659,
+               "Rens": 30002510, "Hek": 30002053}
+ROUTE = "https://esi.evetech.net/latest/route/{a}/{b}/?datasource=tranquility&flag={flag}"
+ROUTE_FLAGS = ["secure", "shortest"]   # highsec-only vs absolute shortest (lowsec/null allowed)
 IDS_CACHE = "ids_cache.json"
 VOL_CACHE = "vol_cache.json"
+ROUTES_CACHE = "routes_cache.json"
 HTML = "index.html"
 UA = "BONK-Arbitrage/1.0 (Crown & Oak Capital; salesmaxxllc@gmail.com)"
 
@@ -39,7 +45,8 @@ UA = "BONK-Arbitrage/1.0 (Crown & Oak Capital; salesmaxxllc@gmail.com)"
 DEF_TAX = 3.37      # sales tax % (a market sale always pays this)
 DEF_BROKER = 3.0    # broker fee % (relist model only; selling into a buy order pays none)
 DEF_FREIGHT = 0.0   # ISK per m3 hauling cost (operator's own rate)
-DEF_MIN_VOL = 100   # hide items with less sell order depth than this at the deepest hub
+DEF_CARGO = 60000   # m3 of hold the operator fills per run (a jump freighter); drives ISK per jump
+DEF_MIN_VOL = 100   # hide items with fewer units on sale at the buy hub than this (the source cap)
 THIN = 0.30         # flag a hub's sell price "thin" when raw min and 5% percentile diverge > this
 
 # Ships: SDE volume is the ASSEMBLED size (wrong for hauling). Override with the standard
@@ -353,7 +360,7 @@ def build_rows(ids_by_name, vols):
     for tid in ids:
         s = str(tid)
         name = name_by_id.get(tid)
-        sells, raw_min, buys, depth = {}, {}, {}, 0.0
+        sells, raw_min, buys, sellvol = {}, {}, {}, {}
         for hub in live_hubs:
             agg = px[hub].get(s)
             if not agg:
@@ -364,10 +371,10 @@ def build_rows(ids_by_name, vols):
             if rs > 0:
                 sells[hub] = rs
                 raw_min[hub] = _f(sell.get("min"))
+                sellvol[hub] = _f(sell.get("volume"))
             rb = robust_buy(buy)
             if rb > 0:
                 buys[hub] = rb
-            depth = max(depth, _f(sell.get("volume")))
         if len(sells) < 2:                       # need 2+ hubs to arbitrage
             continue
         buy_hub = min(sells, key=sells.get)      # acquire cheapest
@@ -389,10 +396,60 @@ def build_rows(ids_by_name, vols):
             "n": name, "bh": buy_hub, "bc": round(buy_cost, 2),
             "fh": flip_hub, "fp": flip_price,
             "lh": list_hub, "lp": list_price,
-            "m3": vols.get(tid), "vol": int(depth), "thin": thin,
+            "m3": vols.get(tid), "vol": int(sellvol.get(buy_hub, 0)), "thin": thin,
         })
     rows.sort(key=lambda r: r["n"].lower())
     return rows, live_hubs
+
+
+def esi_jumps(a, b, flag):
+    """Jump count between two solar systems via ESI /route (len(route) - 1). None on failure."""
+    try:
+        d = fetch_json(ROUTE.format(a=a, b=b, flag=flag))
+        if isinstance(d, list) and d:
+            return len(d) - 1
+    except Exception as e:
+        print(f"    route {a}->{b} ({flag}) failed: {e}")
+    return None
+
+
+def jump_matrices(refresh=False, max_days=30):
+    """{flag: {hubA: {hubB: jumps}}} for each route flag. Cached; hubs are static so the TTL is long."""
+    names = [h for h, _ in HUBS]
+    if not refresh and os.path.exists(ROUTES_CACHE):
+        try:
+            obj = json.load(open(ROUTES_CACHE, encoding="utf-8"))
+            fresh = (datetime.now(timezone.utc) - datetime.fromisoformat(obj["built"])).days < max_days
+            J = obj.get("jumps") or {}
+            ok = all(f in J and all(a in J[f] and all(J[f][a].get(b) is not None for b in names if b != a)
+                                    for a in names) for f in ROUTE_FLAGS)
+            if fresh and ok:
+                return J
+        except Exception:
+            pass
+    print("  Fetching hub to hub jump distances from ESI /route...")
+    J = {f: {a: {a: 0} for a in names} for f in ROUTE_FLAGS}
+    for f in ROUTE_FLAGS:
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                j = esi_jumps(HUB_SYSTEMS[a], HUB_SYSTEMS[b], f)
+                J[f][a][b] = j
+                J[f][b][a] = j
+                time.sleep(0.1)
+        print(f"    {f}: " + ", ".join(f"{a}>{b}={J[f][a][b]}"
+                                       for i, a in enumerate(names) for b in names[i + 1:]))
+    # Only cache a COMPLETE matrix; a transient ESI miss must not freeze a null in for max_days.
+    complete = all(J[f][a].get(b) is not None
+                   for f in ROUTE_FLAGS for i, a in enumerate(names) for b in names[i + 1:])
+    if complete:
+        try:
+            json.dump({"built": datetime.now(timezone.utc).isoformat(), "jumps": J},
+                      open(ROUTES_CACHE, "w", encoding="utf-8"))
+        except Exception:
+            pass
+    else:
+        print("    (incomplete jump matrix; not caching, will retry next run)")
+    return J
 
 
 def main():
@@ -436,11 +493,17 @@ def main():
         print("  No cross hub spreads found (every item priced at fewer than 2 hubs).")
         return 1
 
+    try:
+        jumps = jump_matrices(refresh=args.refresh)
+    except Exception as e:
+        print(f"  Could not fetch jump distances: {e}")
+        jumps = {}
+
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "item_count": len(rows), "hubs": live_hubs,
-        "defaults": {"tax": DEF_TAX, "broker": DEF_BROKER,
-                     "freight": DEF_FREIGHT, "min_vol": DEF_MIN_VOL},
+        "item_count": len(rows), "hubs": live_hubs, "jumps": jumps,
+        "defaults": {"tax": DEF_TAX, "broker": DEF_BROKER, "freight": DEF_FREIGHT,
+                     "cargo": DEF_CARGO, "min_vol": DEF_MIN_VOL},
         "rows": rows,
     }
     import arbitrage_page

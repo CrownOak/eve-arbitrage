@@ -31,13 +31,15 @@ jobs:
         run: python arbitrage.py --allow-unlocked   # public page (unlocked)
 
       - name: Persist caches to this repo
+        if: always()   # save freshly fetched caches even if the page build aborted (e.g. <2 hubs)
         run: |
           git config user.name  "eve-ops-bot"
           git config user.email "eve-ops-bot@users.noreply.github.com"
-          for f in ids_cache.json vol_cache.json; do [ -f "$f" ] && git add -f "$f"; done
+          for f in ids_cache.json vol_cache.json routes_cache.json; do [ -f "$f" ] && git add -f "$f"; done
           if ! git diff --cached --quiet; then
             git commit -m "state: $(date -u +%FT%TZ)"
-            for i in 1 2 3 4 5; do git push && break || { git pull --rebase; sleep $((RANDOM % 4 + 2)); }; done
+            pushed=0; for i in 1 2 3 4 5; do if git push; then pushed=1; break; fi; git pull --rebase; sleep $((RANDOM % 4 + 2)); done
+            [ "$pushed" = 1 ] || { echo "cache push failed after 5 tries"; exit 1; }
           fi
 
       - name: Checkout wdeve
@@ -57,5 +59,6 @@ jobs:
           git add arbitrage/index.html
           if ! git diff --cached --quiet; then
             git commit -m "arbitrage: page update $(date -u +%FT%TZ)"
-            for i in 1 2 3 4 5; do git push && break || { git pull --rebase; sleep $((RANDOM % 4 + 2)); }; done
+            pushed=0; for i in 1 2 3 4 5; do if git push; then pushed=1; break; fi; git pull --rebase; sleep $((RANDOM % 4 + 2)); done
+            [ "$pushed" = 1 ] || { echo "wdeve push failed after 5 tries"; exit 1; }
           fi
