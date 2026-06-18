@@ -1,0 +1,61 @@
+name: run
+# Hub arbitrage: fetch buy/sell prices across the five trade hubs for the curated watchlist,
+# render the public page (client does the fee + freight math), persist the ids/volume caches
+# to this repo, publish the page to wdeve/arbitrage/ via the deploy key.
+on:
+  schedule:
+    - cron: '37 * * * *'       # hourly, :37 UTC (offset from the other tools)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: run-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install deps
+        run: pip install --quiet cryptography
+
+      - name: Build page
+        run: python arbitrage.py --allow-unlocked   # public page (unlocked)
+
+      - name: Persist caches to this repo
+        run: |
+          git config user.name  "eve-ops-bot"
+          git config user.email "eve-ops-bot@users.noreply.github.com"
+          for f in ids_cache.json vol_cache.json; do [ -f "$f" ] && git add -f "$f"; done
+          if ! git diff --cached --quiet; then
+            git commit -m "state: $(date -u +%FT%TZ)"
+            for i in 1 2 3 4 5; do git push && break || { git pull --rebase; sleep $((RANDOM % 4 + 2)); }; done
+          fi
+
+      - name: Checkout wdeve
+        uses: actions/checkout@v4
+        with:
+          repository: CrownOak/wdeve
+          ssh-key: ${{ secrets.WDEVE_DEPLOY_KEY }}
+          path: _wdeve
+
+      - name: Publish page to wdeve
+        run: |
+          mkdir -p _wdeve/arbitrage
+          cp index.html _wdeve/arbitrage/index.html
+          cd _wdeve
+          git config user.name  "eve-ops-bot"
+          git config user.email "eve-ops-bot@users.noreply.github.com"
+          git add arbitrage/index.html
+          if ! git diff --cached --quiet; then
+            git commit -m "arbitrage: page update $(date -u +%FT%TZ)"
+            for i in 1 2 3 4 5; do git push && break || { git pull --rebase; sleep $((RANDOM % 4 + 2)); }; done
+          fi

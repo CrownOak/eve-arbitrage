@@ -1,0 +1,12 @@
+# venv + caches
+.venv/
+__pycache__/
+*.pyc
+
+# runtime + local-only
+arb.log
+*.tmp
+
+# tracked: index.html + source (.py) + the workflow.
+# ids_cache.json + vol_cache.json are committed (force-added by CI) so a normal hourly
+# run only hits Fuzzwork (no ESI / SDE re-fetch).
