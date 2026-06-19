@@ -35,9 +35,11 @@ def render_page(data):
         <input id="broker" type="number" value="3.0" min="0" step="0.1"></label>
       <label class="rlab" data-tip="Your hauling cost in ISK per cubic metre. Folds into ISK/m3 and ISK/jump so you see what survives the trip.">Freight ISK/m&sup3;
         <input id="freight" type="number" value="0" min="0" step="1"></label>
-      <label class="rlab" data-tip="How much cargo you fill per run, in cubic metres. Sets the scale of the ISK/jump wage. A jump freighter is about 60000.">Cargo m&sup3;
+      <label class="rlab" data-tip="How much cargo you fill per run, in cubic metres. A jump freighter is about 60000. ISK/jump never assumes more than this, or more than the destination can absorb.">Cargo m&sup3;
         <input id="cargo" type="number" value="60000" min="1" step="1000"></label>
-      <label class="rlab" data-tip="Hide items with fewer units on sale at the buy hub than this. A margin you cannot source is not an opportunity.">Min sell vol
+      <label class="rlab" data-tip="Days of the destination's traded volume you move per trip. ISK/jump caps the haul at this many days of what the sell hub actually trades, so a thin market cannot pretend to fill a freighter.">Days of vol
+        <input id="days" type="number" value="1" min="0.1" step="0.5"></label>
+      <label class="rlab" data-tip="Hide items the destination trades fewer than this many units per day. A spread you cannot actually sell into is not an opportunity.">Min day vol
         <input id="minvol" type="number" value="100" min="0" step="50"></label>
     </div>
     <div class="rctl">
@@ -63,8 +65,8 @@ def render_page(data):
       <th data-sort="margin" data-tip="Net profit as a percent of buy cost. How hard your ISK works.">MARGIN</th>
       <th data-sort="m3"     data-tip="Volume of one unit. Ships use packaged (transport) volume.">m&sup3;</th>
       <th data-sort="iskm3"  data-tip="Net ISK per cubic metre, after fees and your freight rate. Rank cargo by this when distance does not matter.">ISK / M&sup3;</th>
-      <th data-sort="iskjump" data-tip="The headline: net ISK per jump for the cargo you can actually move on this route (your hold, or the units on sale at the buy hub, whichever is smaller), after fees and freight. Travel is the job, so this ranks routes by what each jump pays.">ISK / JUMP</th>
-      <th data-sort="vol"    data-tip="Units on sell orders at the buy hub: what you can source cheaply in one trip. A liquidity proxy, not daily traded volume.">SELL VOL</th>
+      <th data-sort="iskjump" data-tip="The headline: net ISK per jump for the cargo you can realistically move, after fees and freight. The haul is capped at your hold AND at the days of volume the destination actually trades, so thin markets cannot inflate it. Travel is the job, so this ranks routes by what each jump pays.">ISK / JUMP</th>
+      <th data-sort="dvol"   data-tip="Average units actually TRADED per day at the sell hub (ESI market history). The real cap on how much one haul can move, not an order book snapshot.">DAY VOL</th>
     </tr></thead><tbody id="tb"></tbody></table>
 """
     sub = (f"buy low in one hub, sell high in another &middot; ranked by ISK per jump, because travel is the job "
@@ -103,12 +105,13 @@ def render_page(data):
   at the buy hub); All reveals everything, thin and negative spreads included. <b>JUMPS</b> come
   from the in game route: Highsec is the safe freighter path,
   Shortest is fewest jumps and may cross lowsec. <b>ISK/JUMP</b> is the net profit for the cargo you
-  can actually move (your hold, capped by the units on sale at the buy hub) divided by the jumps, so
-  a fat margin twenty jumps away loses to a fair one next door, and a thin market cannot pretend to
-  fill a freighter. All figures are net of fees, never gross. Buy cost uses the robust cheapest 5%
-  sell price so a single mispriced order cannot invent a margin; a <b>thin</b> tag flags an item
-  whose lowest order diverges from that. SELL VOL is the units on sale at the buy hub, a liquidity
-  proxy and the cap on what you can source in one trip.
+  can realistically move, divided by the jumps, so a fat margin twenty jumps away loses to a fair one
+  next door. The haul is capped at your hold AND at the days of volume the destination actually trades
+  (from ESI market history), so a spread in a market that only moves a few units a day cannot pretend
+  to fill a freighter. <b>DAY VOL</b> is the average units traded per day at the sell hub, the real
+  liquidity and the binding limit on most hauls. All figures are net of fees, never gross. Buy cost
+  uses the robust cheapest 5% sell price so a single mispriced order cannot invent a margin; a
+  <b>thin</b> tag flags an item whose lowest order diverges from that.
   Prices are region level and refresh hourly. This is market data, not a promise of profit. Fly safe,
   the gank on the Tama gate is your problem.</footer>
 <script>var DATA = {blob};</script>
@@ -116,7 +119,8 @@ def render_page(data):
 (function(){{
   var D = DATA.rows, DF = DATA.defaults || {{}}, J = DATA.jumps || {{}};
   var st = {{ tax:DF.tax!=null?DF.tax:3.37, broker:DF.broker!=null?DF.broker:3.0,
-             freight:DF.freight||0, cargo:DF.cargo||60000, minvol:DF.min_vol!=null?DF.min_vol:100,
+             freight:DF.freight||0, cargo:DF.cargo||60000, days:DF.days!=null?DF.days:1,
+             minvol:DF.min_vol!=null?DF.min_vol:100,
              model:"list", flag:"secure", q:"", all:false, key:"iskjump", dir:-1 }};
   function isk(v){{ if(v==null) return "n/a"; var a=Math.abs(v);
     if(a>=1e9) return (v/1e9).toFixed(2)+"B"; if(a>=1e6) return (v/1e6).toFixed(2)+"M";
@@ -130,28 +134,29 @@ def render_page(data):
     if(!r) return null; var j=r[to]; return (j==null)?null:j; }}
   // net the RAW baked prices with the current fee/freight/cargo inputs, for the selected model + route
   function calc(r){{
-    var tax=st.tax/100, broker=st.broker/100, buy=r.bc, dest, net;
-    if(st.model==="flip"){{ net=(r.fh!=null && r.fp!=null) ? (r.fp*(1-tax) - buy) : null; dest=(net!=null)?r.fh:null; }}  // tax only
-    else {{ dest=r.lh; net=r.lp*(1-tax-broker) - buy; }}                                                  // tax + broker
+    var tax=st.tax/100, broker=st.broker/100, buy=r.bc, dest, net, dvol;
+    if(st.model==="flip"){{ net=(r.fh!=null && r.fp!=null) ? (r.fp*(1-tax) - buy) : null; dest=(net!=null)?r.fh:null; dvol=(r.fdv!=null?r.fdv:0); }}  // tax only
+    else {{ dest=r.lh; net=r.lp*(1-tax-broker) - buy; dvol=(r.ldv!=null?r.ldv:0); }}                       // tax + broker
     var m3=(r.m3 && r.m3>0) ? r.m3 : null;
     var iskm3=(net!=null && m3!=null) ? (net/m3 - st.freight) : null;        // after freight
     var jumps=jumpsOf(r.bh,dest);
-    var fillM3=(m3!=null) ? Math.min(st.cargo, r.vol*m3) : null;             // what you can load AND source
-    var iskjump=(iskm3!=null && jumps && fillM3) ? (iskm3*fillM3/jumps) : null;  // wage per jump for that load
+    var units=(m3!=null) ? Math.min(st.cargo/m3, st.days*dvol) : null;       // hold OR days of what the dest trades
+    var realM3=(units!=null) ? units*m3 : null;
+    var iskjump=(iskm3!=null && jumps && realM3>0) ? (iskm3*realM3/jumps) : null;
     var margin=(net!=null && buy>0) ? (net/buy*100) : null;
     return {{ from:r.bh, dest:dest, jumps:jumps, buy:buy, net:net, m3:m3,
-             iskm3:iskm3, iskjump:iskjump, margin:margin, vol:r.vol }};
+             iskm3:iskm3, iskjump:iskjump, margin:margin, dvol:dvol }};
   }}
   function sval(r,c){{ var v=calc(r);
     switch(c){{
       case "n": return r.n; case "route": return v.dest==null?null:(v.from+" "+v.dest);
       case "jumps": return v.jumps; case "bc": return v.buy; case "net": return v.net;
       case "margin": return v.margin; case "m3": return v.m3; case "iskm3": return v.iskm3;
-      case "iskjump": return v.iskjump; case "vol": return v.vol; default: return 0; }} }}
+      case "iskjump": return v.iskjump; case "dvol": return v.dvol; default: return 0; }} }}
   function visible(r){{
     if(st.all) return true;
     var v=calc(r);
-    return v.net!=null && v.net>0 && v.vol>=st.minvol;                       // profitable + liquid by default
+    return v.net!=null && v.net>0 && v.dvol>=st.minvol;                      // profitable + the dest actually trades it
   }}
   function cls(v){{ return v>0?"good":(v<0?"bad":""); }}
   function render(){{
@@ -177,7 +182,7 @@ def render_page(data):
         +"<td class='num'>"+m3d(v.m3)+"</td>"
         +"<td class='num "+(v.iskm3==null?"":cls(v.iskm3))+"'>"+(v.iskm3==null?"n/a":isk(v.iskm3))+"</td>"
         +"<td class='num strong "+(v.iskjump==null?"":cls(v.iskjump))+"'>"+(v.iskjump==null?"n/a":isk(v.iskjump))+"</td>"
-        +"<td class='num'>"+qty(v.vol)+"</td></tr>"; }});
+        +"<td class='num'>"+qty(v.dvol)+"</td></tr>"; }});
     if(!src.length) h="<tr><td colspan='10' class='empty' style='padding:24px'>No item matches \\""+st.q+"\\".</td></tr>";
     document.getElementById("tb").innerHTML=h;
     Array.prototype.forEach.call(document.querySelectorAll("th[data-sort]"), function(th){{
@@ -191,7 +196,7 @@ def render_page(data):
       render(); }}; }});
   function bind(id, prop){{ document.getElementById(id).addEventListener("input", function(){{
     st[prop]=parseFloat(this.value)||0; render(); }}); }}
-  bind("tax","tax"); bind("broker","broker"); bind("freight","freight"); bind("cargo","cargo"); bind("minvol","minvol");
+  bind("tax","tax"); bind("broker","broker"); bind("freight","freight"); bind("cargo","cargo"); bind("days","days"); bind("minvol","minvol");
   document.getElementById("q").addEventListener("input", function(){{ st.q=this.value.trim(); render(); }});
   function pair(aId,bId,fn){{ var A=document.getElementById(aId), B=document.getElementById(bId);
     A.onclick=function(){{ fn(true); A.classList.add("on"); B.classList.remove("on"); render(); }};

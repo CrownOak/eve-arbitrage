@@ -34,9 +34,12 @@ HUB_SYSTEMS = {"Jita": 30000142, "Amarr": 30002187, "Dodixie": 30002659,
                "Rens": 30002510, "Hek": 30002053}
 ROUTE = "https://esi.evetech.net/latest/route/{a}/{b}/?datasource=tranquility&flag={flag}"
 ROUTE_FLAGS = ["secure", "shortest"]   # highsec-only vs absolute shortest (lowsec/null allowed)
+HISTORY = "https://esi.evetech.net/latest/markets/{region}/history/?type_id={tid}&datasource=tranquility"
+HIST_DAYS = 7          # average daily traded volume over the last this-many days
 IDS_CACHE = "ids_cache.json"
 VOL_CACHE = "vol_cache.json"
 ROUTES_CACHE = "routes_cache.json"
+HIST_CACHE = "hist_cache.json"
 HTML = "index.html"
 UA = "BONK-Arbitrage/1.0 (Crown & Oak Capital; salesmaxxllc@gmail.com)"
 
@@ -46,7 +49,8 @@ DEF_TAX = 3.37      # sales tax % (a market sale always pays this)
 DEF_BROKER = 3.0    # broker fee % (relist model only; selling into a buy order pays none)
 DEF_FREIGHT = 0.0   # ISK per m3 hauling cost (operator's own rate)
 DEF_CARGO = 60000   # m3 of hold the operator fills per run (a jump freighter); drives ISK per jump
-DEF_MIN_VOL = 100   # hide items with fewer units on sale at the buy hub than this (the source cap)
+DEF_DAYS = 1        # days of the destination's traded volume you realistically move per trip
+DEF_MIN_VOL = 100   # hide items the destination trades fewer than this many units per day (illiquid)
 THIN = 0.30         # flag a hub's sell price "thin" when raw min and 5% percentile diverge > this
 
 # Ships: SDE volume is the ASSEMBLED size (wrong for hauling). Override with the standard
@@ -452,6 +456,56 @@ def jump_matrices(refresh=False, max_days=30):
     return J
 
 
+def esi_daily_volume(tid, region, days=HIST_DAYS):
+    """Average units traded per day for one type in one region (ESI market history). 0 if untraded."""
+    try:
+        d = fetch_json(HISTORY.format(region=region, tid=tid))
+        if isinstance(d, list) and d:
+            last = d[-days:]
+            vols = [int(x.get("volume") or 0) for x in last]
+            return int(sum(vols) / len(vols)) if vols else 0
+    except Exception:
+        pass
+    return 0
+
+
+def daily_volumes(pairs, refresh=False, max_days=2):
+    """{(tid, region): avg_daily_units} for the requested (type, region) pairs. Cached ~2 days
+    (traded volume moves slowly), so a normal hourly run hits the cache and skips ESI history."""
+    cache = {}
+    if os.path.exists(HIST_CACHE):
+        try:
+            cache = json.load(open(HIST_CACHE, encoding="utf-8"))
+        except Exception:
+            cache = {}
+    now = datetime.now(timezone.utc)
+    out, fetched = {}, 0
+    for tid, region in pairs:
+        k = f"{tid}:{region}"
+        c = cache.get(k)
+        fresh = False
+        if c:
+            try:
+                fresh = (now - datetime.fromisoformat(c["built"])).days < max_days
+            except Exception:
+                fresh = False
+        if not refresh and fresh:
+            out[(tid, region)] = c["v"]
+        else:
+            v = esi_daily_volume(tid, region)
+            out[(tid, region)] = v
+            cache[k] = {"built": now.isoformat(), "v": v}
+            fetched += 1
+            time.sleep(0.04)
+    if fetched:
+        try:
+            json.dump(cache, open(HIST_CACHE, "w", encoding="utf-8"))
+        except Exception:
+            pass
+    print(f"  Daily volume: {fetched} fetched from ESI history, {len(pairs) - fetched} cached.")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description="Build the hub arbitrage calculator page.")
     ap.add_argument("--refresh", action="store_true", help="force ids + volume caches to rebuild")
@@ -499,11 +553,34 @@ def main():
         print(f"  Could not fetch jump distances: {e}")
         jumps = {}
 
+    # Daily traded volume at each row's destination hub(s): the real cap on what a single haul can
+    # move without crashing the price (a thin destination, not the deep Jita source, is the limit).
+    hub_region = {name: rid for name, rid in HUBS}
+    pairs = set()
+    for r in rows:
+        tid = ids_by_name.get(r["n"])
+        if tid is None:
+            continue
+        if r.get("lh"):
+            pairs.add((tid, hub_region[r["lh"]]))
+        if r.get("fh"):
+            pairs.add((tid, hub_region[r["fh"]]))
+    print(f"  Fetching destination daily volume for {len(pairs)} (item, hub) pairs...")
+    try:
+        dv = daily_volumes(pairs, refresh=args.refresh)
+    except Exception as e:
+        print(f"  Could not fetch daily volumes: {e}")
+        dv = {}
+    for r in rows:
+        tid = ids_by_name.get(r["n"])
+        r["ldv"] = dv.get((tid, hub_region.get(r["lh"])), 0) if r.get("lh") else 0
+        r["fdv"] = (dv.get((tid, hub_region.get(r["fh"])), 0) if r.get("fh") else None)
+
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "item_count": len(rows), "hubs": live_hubs, "jumps": jumps,
         "defaults": {"tax": DEF_TAX, "broker": DEF_BROKER, "freight": DEF_FREIGHT,
-                     "cargo": DEF_CARGO, "min_vol": DEF_MIN_VOL},
+                     "cargo": DEF_CARGO, "days": DEF_DAYS, "min_vol": DEF_MIN_VOL},
         "rows": rows,
     }
     import arbitrage_page
