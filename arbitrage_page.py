@@ -22,7 +22,8 @@ def render_page(data):
     hubs = ", ".join(data.get("hubs") or [])
     d = data.get("defaults") or {}
     rows = data.get("rows") or []
-    blob = json.dumps({"rows": rows, "defaults": d, "jumps": data.get("jumps") or {}})
+    blob = json.dumps({"rows": rows, "defaults": d, "jumps": data.get("jumps") or {},
+                       "danger": data.get("danger") or {}})
     if not rows:
         inner = '<div class="empty">No data yet. The hourly run will populate this page.</div>'
     else:
@@ -60,6 +61,7 @@ def render_page(data):
       <th data-sort="n"      data-tip="Item name. A thin tag means one hub's cheapest sell order looks like a fat finger, so treat its margin with suspicion.">ITEM</th>
       <th data-sort="route"  data-tip="The profitable direction: buy at the first hub, sell at the second. Switches with the Model toggle (relist hub for LIST, the hub whose buy orders pay most for FLIP).">ROUTE</th>
       <th data-sort="jumps"  data-tip="Jumps between the two hubs on the selected route type. Highsec is the safe freighter route; Shortest is fewest jumps and may cross lowsec.">JUMPS</th>
+      <th data-sort="danger" data-tip="Recent gank risk on the selected route: lowsec or null exposure plus PvP kills along the path, smoothed over recent hours. Switches with the Route toggle. Sort it to float the safe hauls to the top.">DANGER</th>
       <th data-sort="bc"     data-tip="Cost to buy one unit at the first hub, using the robust cheapest 5% sell price (not the single lowest order).">BUY COST</th>
       <th data-sort="net"    data-tip="Net ISK per unit on the selected model, after fees and before freight. LIST pays sales tax plus broker; FLIP pays sales tax only. Never guaranteed on the LIST model.">NET / UNIT</th>
       <th data-sort="margin" data-tip="Net profit as a percent of buy cost. How hard your ISK works.">MARGIN</th>
@@ -88,6 +90,9 @@ def render_page(data):
   th[data-sort]:hover{{ color:var(--laser); }}
   th .ar{{ color:var(--ore); margin-left:4px; font-size:10px; }}
   td.who{{ text-align:left; }}
+  .dgr{{ display:inline-block; font-family:var(--mono); font-size:10px; font-weight:700; text-transform:uppercase;
+         letter-spacing:.05em; padding:2px 8px; border:1px solid currentColor; cursor:help; }}
+  .dgr.good{{ color:var(--ore); }} .dgr.warn{{ color:var(--amber); }} .dgr.bad{{ color:var(--red); }}
 </style></head>
 <body>
   <header>
@@ -112,12 +117,15 @@ def render_page(data):
   liquidity and the binding limit on most hauls. All figures are net of fees, never gross. Buy cost
   uses the robust cheapest 5% sell price so a single mispriced order cannot invent a margin; a
   <b>thin</b> tag flags an item whose lowest order diverges from that.
+  <b>DANGER</b> scores recent gank risk on the selected route: any lowsec or null on the path reads
+  deadly, otherwise it is PvP kills along the highsec path smoothed over recent hours. Hover it for the
+  worst system on the route, and sort by it to keep the freighter alive.
   Prices are region level and refresh hourly. This is market data, not a promise of profit. Fly safe,
-  the gank on the Tama gate is your problem.</footer>
+  the gank on the Tama gate is now a column.</footer>
 <script>var DATA = {blob};</script>
 <script>
 (function(){{
-  var D = DATA.rows, DF = DATA.defaults || {{}}, J = DATA.jumps || {{}};
+  var D = DATA.rows, DF = DATA.defaults || {{}}, J = DATA.jumps || {{}}, DG = DATA.danger || {{}};
   var st = {{ tax:DF.tax!=null?DF.tax:3.37, broker:DF.broker!=null?DF.broker:3.0,
              freight:DF.freight||0, cargo:DF.cargo||60000, days:DF.days!=null?DF.days:1,
              minvol:DF.min_vol!=null?DF.min_vol:100,
@@ -132,6 +140,13 @@ def render_page(data):
     if(v>=1e3) return (v/1e3).toFixed(1)+"k"; return String(v); }}
   function jumpsOf(from,to){{ if(!from||!to) return null; var f=J[st.flag]||{{}}; var r=f[from];
     if(!r) return null; var j=r[to]; return (j==null)?null:j; }}
+  function esc(s){{ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/'/g,"&#39;"); }}
+  function dangerOf(from,to){{ if(!from||!to) return null; var f=DG[st.flag]||{{}}; var r=f[from];
+    if(!r) return null; return r[to]||null; }}
+  function dtip(dg){{ if(!dg) return "Route danger unknown.";
+    if(dg.band==="deadly") return "Deadly: "+(dg.worst||"crosses lowsec or null")+". Not a blind freighter run, take Highsec or scout it.";
+    if(dg.band==="risky") return "Risky: hottest spot "+(dg.worst||"a gank chokepoint")+". Watch local and keep aligned.";
+    return "Looks clear: "+(dg.worst||"no recent ganks on this path")+"."; }}
   // net the RAW baked prices with the current fee/freight/cargo inputs, for the selected model + route
   function calc(r){{
     var tax=st.tax/100, broker=st.broker/100, buy=r.bc, dest, net, dvol;
@@ -150,7 +165,9 @@ def render_page(data):
   function sval(r,c){{ var v=calc(r);
     switch(c){{
       case "n": return r.n; case "route": return v.dest==null?null:(v.from+" "+v.dest);
-      case "jumps": return v.jumps; case "bc": return v.buy; case "net": return v.net;
+      case "jumps": return v.jumps;
+      case "danger": var dd=dangerOf(v.from,v.dest); return dd?dd.score:null;
+      case "bc": return v.buy; case "net": return v.net;
       case "margin": return v.margin; case "m3": return v.m3; case "iskm3": return v.iskm3;
       case "iskjump": return v.iskjump; case "dvol": return v.dvol; default: return 0; }} }}
   function visible(r){{
@@ -172,10 +189,13 @@ def render_page(data):
     src.forEach(function(r){{ var v=calc(r);
       var tag=r.thin?" <span class='kbadge npc' data-tip='One hub has a lone cheap sell order well below the rest. The margin may be a fat finger, not a real spread.'>thin</span>":"";
       var route=v.from+" &rsaquo; "+(v.dest||"n/a");
+      var dg=dangerOf(v.from,v.dest);
+      var dgh=dg?("<span class='dgr "+(dg.band==="deadly"?"bad":(dg.band==="risky"?"warn":"good"))+"' data-tip='"+esc(dtip(dg))+"'>"+dg.band+"</span>"):"<span class='num'>n/a</span>";
       h+="<tr>"
         +"<td class='who'><span class='strong'>"+r.n+"</span>"+tag+"</td>"
         +"<td class='cat'>"+route+"</td>"
         +"<td class='num'>"+(v.jumps==null?"n/a":v.jumps)+"</td>"
+        +"<td>"+dgh+"</td>"
         +"<td class='num'>"+isk(v.buy)+"</td>"
         +"<td class='num strong "+(v.net==null?"":cls(v.net))+"'>"+isk(v.net)+"</td>"
         +"<td class='num "+(v.margin==null?"":cls(v.margin))+"'>"+(v.margin==null?"n/a":Math.round(v.margin)+"%")+"</td>"
@@ -183,7 +203,7 @@ def render_page(data):
         +"<td class='num "+(v.iskm3==null?"":cls(v.iskm3))+"'>"+(v.iskm3==null?"n/a":isk(v.iskm3))+"</td>"
         +"<td class='num strong "+(v.iskjump==null?"":cls(v.iskjump))+"'>"+(v.iskjump==null?"n/a":isk(v.iskjump))+"</td>"
         +"<td class='num'>"+qty(v.dvol)+"</td></tr>"; }});
-    if(!src.length) h="<tr><td colspan='10' class='empty' style='padding:24px'>No item matches \\""+st.q+"\\".</td></tr>";
+    if(!src.length) h="<tr><td colspan='11' class='empty' style='padding:24px'>No item matches \\""+st.q+"\\".</td></tr>";
     document.getElementById("tb").innerHTML=h;
     Array.prototype.forEach.call(document.querySelectorAll("th[data-sort]"), function(th){{
       var k=th.getAttribute("data-sort"); var old=th.querySelector(".ar"); if(old) old.remove();

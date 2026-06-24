@@ -36,10 +36,19 @@ ROUTE = "https://esi.evetech.net/latest/route/{a}/{b}/?datasource=tranquility&fl
 ROUTE_FLAGS = ["secure", "shortest"]   # highsec-only vs absolute shortest (lowsec/null allowed)
 HISTORY = "https://esi.evetech.net/latest/markets/{region}/history/?type_id={tid}&datasource=tranquility"
 HIST_DAYS = 7          # average daily traded volume over the last this-many days
+# Route gank-danger layer: per-system kills (smoothed across the hourly runs) + lowsec/null exposure.
+SYS_KILLS = "https://esi.evetech.net/latest/universe/system_kills/?datasource=tranquility"
+MAP_SYS = SDE + "mapSolarSystems.csv"   # SDE dump: solarSystemID, solarSystemName, security
+DANGER_DECAY = 0.6      # EMA weight on the prior hour (0.4 on the newest hour) so danger reflects "lately"
+NULL_PENALTY = 1000.0   # any nullsec system on a freighter route = deadly
+LOWSEC_PENALTY = 350.0  # any lowsec system = effectively deadly for a hauler
+HS_KILL_WEIGHT = 25.0   # points per recent PvP kill/hr (EMA) in a HIGHSEC system (gank chokepoints)
 IDS_CACHE = "ids_cache.json"
 VOL_CACHE = "vol_cache.json"
 ROUTES_CACHE = "routes_cache.json"
 HIST_CACHE = "hist_cache.json"
+DANGER_CACHE = "danger_cache.json"   # per-system kill EMA, persisted hourly by CI
+SYS_CACHE = "sys_cache.json"         # per-system security + name from the SDE (long TTL)
 HTML = "index.html"
 UA = "BONK-Arbitrage/1.0 (Crown & Oak Capital; salesmaxxllc@gmail.com)"
 
@@ -406,54 +415,204 @@ def build_rows(ids_by_name, vols):
     return rows, live_hubs
 
 
-def esi_jumps(a, b, flag):
-    """Jump count between two solar systems via ESI /route (len(route) - 1). None on failure."""
+def esi_route_path(a, b, flag):
+    """Full system-id path between two solar systems via ESI /route. None on failure."""
     try:
         d = fetch_json(ROUTE.format(a=a, b=b, flag=flag))
         if isinstance(d, list) and d:
-            return len(d) - 1
+            return [int(s) for s in d]
     except Exception as e:
         print(f"    route {a}->{b} ({flag}) failed: {e}")
     return None
 
 
 def jump_matrices(refresh=False, max_days=30):
-    """{flag: {hubA: {hubB: jumps}}} for each route flag. Cached; hubs are static so the TTL is long."""
+    """(J, P): J[flag][a][b] = jumps, P[flag][a][b] = [system_ids]. Cached together; hubs are static
+    so the TTL is long. The path feeds the route-danger layer; jumps are just len(path) - 1."""
     names = [h for h, _ in HUBS]
     if not refresh and os.path.exists(ROUTES_CACHE):
         try:
             obj = json.load(open(ROUTES_CACHE, encoding="utf-8"))
             fresh = (datetime.now(timezone.utc) - datetime.fromisoformat(obj["built"])).days < max_days
-            J = obj.get("jumps") or {}
-            ok = all(f in J and all(a in J[f] and all(J[f][a].get(b) is not None for b in names if b != a)
-                                    for a in names) for f in ROUTE_FLAGS)
+            J, P = obj.get("jumps") or {}, obj.get("paths") or {}
+            ok = all(f in J and f in P
+                     and all(a in J[f] and all(J[f][a].get(b) is not None for b in names if b != a) for a in names)
+                     and all(a in P[f] and all(P[f][a].get(b) for b in names if b != a) for a in names)
+                     for f in ROUTE_FLAGS)
             if fresh and ok:
-                return J
+                return J, P
         except Exception:
             pass
-    print("  Fetching hub to hub jump distances from ESI /route...")
+    print("  Fetching hub to hub routes from ESI /route...")
     J = {f: {a: {a: 0} for a in names} for f in ROUTE_FLAGS}
+    P = {f: {a: {a: [HUB_SYSTEMS[a]]} for a in names} for f in ROUTE_FLAGS}
     for f in ROUTE_FLAGS:
         for i, a in enumerate(names):
             for b in names[i + 1:]:
-                j = esi_jumps(HUB_SYSTEMS[a], HUB_SYSTEMS[b], f)
-                J[f][a][b] = j
-                J[f][b][a] = j
+                path = esi_route_path(HUB_SYSTEMS[a], HUB_SYSTEMS[b], f)
+                j = (len(path) - 1) if path else None
+                J[f][a][b] = J[f][b][a] = j
+                P[f][a][b] = path
+                P[f][b][a] = list(reversed(path)) if path else None
                 time.sleep(0.1)
         print(f"    {f}: " + ", ".join(f"{a}>{b}={J[f][a][b]}"
                                        for i, a in enumerate(names) for b in names[i + 1:]))
     # Only cache a COMPLETE matrix; a transient ESI miss must not freeze a null in for max_days.
-    complete = all(J[f][a].get(b) is not None
+    complete = all(J[f][a].get(b) is not None and P[f][a].get(b)
                    for f in ROUTE_FLAGS for i, a in enumerate(names) for b in names[i + 1:])
     if complete:
         try:
-            json.dump({"built": datetime.now(timezone.utc).isoformat(), "jumps": J},
+            json.dump({"built": datetime.now(timezone.utc).isoformat(), "jumps": J, "paths": P},
                       open(ROUTES_CACHE, "w", encoding="utf-8"))
         except Exception:
             pass
     else:
-        print("    (incomplete jump matrix; not caching, will retry next run)")
-    return J
+        print("    (incomplete route matrix; not caching, will retry next run)")
+    return J, P
+
+
+def fetch_system_kills():
+    """{system_id: ship_kills + pod_kills} in the last hour, from ESI /universe/system_kills (one call).
+    Only PvP kills (ship + pod); NPC kills are ignored. Systems with no activity are simply absent."""
+    out = {}
+    try:
+        d = fetch_json(SYS_KILLS)
+        if isinstance(d, list):
+            for e in d:
+                sid = e.get("system_id")
+                if sid is not None:
+                    out[int(sid)] = int(e.get("ship_kills") or 0) + int(e.get("pod_kills") or 0)
+    except Exception as ex:
+        print(f"    system_kills fetch failed: {ex}")
+    return out
+
+
+def update_danger_ema(track, kills_now):
+    """EMA of hourly PvP kills per tracked system, persisted across the hourly runs so danger
+    reflects recent activity, not just the last 60 minutes. Systems not in this hour's feed decay
+    toward 0. Only systems on our hub routes are tracked, so the cache stays tiny."""
+    prev = {}
+    if os.path.exists(DANGER_CACHE):
+        try:
+            prev = (json.load(open(DANGER_CACHE, encoding="utf-8")) or {}).get("ema", {})
+        except Exception:
+            prev = {}
+    ema = {}
+    for sid in track:
+        p = float(prev.get(str(sid), 0.0))
+        now = float(kills_now.get(int(sid), 0))
+        ema[str(sid)] = round(DANGER_DECAY * p + (1 - DANGER_DECAY) * now, 3)
+    try:
+        json.dump({"built": datetime.now(timezone.utc).isoformat(), "ema": ema},
+                  open(DANGER_CACHE, "w", encoding="utf-8"))
+    except Exception:
+        pass
+    return {int(k): v for k, v in ema.items()}
+
+
+def system_info(sysids, refresh=False, max_days=60):
+    """{system_id: {sec, name}} from the SDE mapSolarSystems dump, for the systems on our routes.
+    Cached long (systems do not move); only re-fetches when a new system appears on a route."""
+    want = set(int(s) for s in sysids)
+    if not refresh and os.path.exists(SYS_CACHE):
+        try:
+            obj = json.load(open(SYS_CACHE, encoding="utf-8"))
+            fresh = (datetime.now(timezone.utc) - datetime.fromisoformat(obj["built"])).days < max_days
+            info = {int(k): v for k, v in obj.get("info", {}).items()}
+            if fresh and want <= set(info):
+                return info
+        except Exception:
+            pass
+    print("  Fetching system security + names from EVE SDE (mapSolarSystems)...")
+    info = {}
+    try:
+        for r in _rows(fetch_text(MAP_SYS)):
+            try:
+                sid = int(r["solarSystemID"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if sid in want:
+                info[sid] = {"sec": round(_f(r.get("security")), 3),
+                             "name": r.get("solarSystemName") or str(sid)}
+    except Exception as e:
+        print(f"  system info fetch failed: {e}")
+    try:
+        json.dump({"built": datetime.now(timezone.utc).isoformat(),
+                   "info": {str(k): v for k, v in info.items()}},
+                  open(SYS_CACHE, "w", encoding="utf-8"))
+    except Exception:
+        pass
+    return info
+
+
+def _sec_class(sec):
+    if sec is None:
+        return "hs"
+    if sec <= 0.0:
+        return "null"
+    if sec < 0.45:
+        return "low"
+    return "hs"
+
+
+def route_danger(path, info, ema):
+    """Score one route path for gank risk + its band + the single worst system (for the tooltip).
+    Lowsec/null exposure dominates (a hauler should not be there); otherwise it is recent highsec
+    gank pressure along the path."""
+    if not path or len(path) < 2:
+        return {"score": 0, "band": "safe", "worst": ""}
+    score, has_low, has_null = 0.0, False, False
+    worst_d, worst_sid = -1.0, path[0]
+    n = len(path)
+    for idx, sid in enumerate(path):
+        if idx == 0 or idx == n - 1:   # skip the hub endpoints; you dock there, it is not a route choice
+            continue
+        meta = info.get(int(sid), {})
+        kls = _sec_class(meta.get("sec"))
+        if kls == "null":
+            d = NULL_PENALTY; has_null = True
+        elif kls == "low":
+            d = LOWSEC_PENALTY; has_low = True
+        else:
+            d = float(ema.get(int(sid), 0.0)) * HS_KILL_WEIGHT
+        score += d
+        if d > worst_d:
+            worst_d, worst_sid = d, sid
+    if has_null or has_low:
+        band = "deadly"
+    elif score >= 200:
+        band = "deadly"
+    elif score >= 60:
+        band = "risky"
+    else:
+        band = "safe"
+    wm = info.get(int(worst_sid), {})
+    wname, wcls = wm.get("name", str(worst_sid)), _sec_class(wm.get("sec"))
+    if wcls == "null":
+        worst = f"{wname} (nullsec)"
+    elif wcls == "low":
+        worst = f"{wname} (lowsec)"
+    elif worst_d > 0:
+        worst = f"{wname} (~{ema.get(int(worst_sid), 0.0):.0f} pvp kills/hr lately)"
+    else:
+        worst = "no recent ganks on the path"
+    return {"score": round(score), "band": band, "worst": worst}
+
+
+def danger_matrix(paths, info, ema):
+    """{flag: {hubA: {hubB: {score, band, worst}}}} keyed exactly like the jump matrix."""
+    names = [h for h, _ in HUBS]
+    out = {}
+    for f in ROUTE_FLAGS:
+        out[f] = {}
+        for a in names:
+            out[f][a] = {}
+            for b in names:
+                if a == b:
+                    out[f][a][b] = {"score": 0, "band": "safe", "worst": ""}
+                else:
+                    out[f][a][b] = route_danger((paths.get(f, {}).get(a, {}) or {}).get(b), info, ema)
+    return out
 
 
 def esi_daily_volume(tid, region, days=HIST_DAYS):
@@ -548,10 +707,29 @@ def main():
         return 1
 
     try:
-        jumps = jump_matrices(refresh=args.refresh)
+        jumps, paths = jump_matrices(refresh=args.refresh)
     except Exception as e:
         print(f"  Could not fetch jump distances: {e}")
-        jumps = {}
+        jumps, paths = {}, {}
+
+    # Route gank-danger layer: lowsec/null exposure + recent PvP kills per system (smoothed hourly).
+    danger = {}
+    try:
+        track = set()
+        for f in ROUTE_FLAGS:
+            for a, byb in (paths.get(f) or {}).items():
+                for b, p in (byb or {}).items():
+                    if p:
+                        track.update(int(s) for s in p)
+        if track:
+            info = system_info(track, refresh=args.refresh)
+            ema = update_danger_ema(track, fetch_system_kills())
+            danger = danger_matrix(paths, info, ema)
+            hot = sum(1 for v in ema.values() if v >= 1)
+            print(f"  Route danger: {len(track)} systems on hub routes, {hot} hot with recent ganks.")
+    except Exception as e:
+        print(f"  Could not compute route danger: {e}")
+        danger = {}
 
     # Daily traded volume at each row's destination hub(s): the real cap on what a single haul can
     # move without crashing the price (a thin destination, not the deep Jita source, is the limit).
@@ -578,7 +756,7 @@ def main():
 
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "item_count": len(rows), "hubs": live_hubs, "jumps": jumps,
+        "item_count": len(rows), "hubs": live_hubs, "jumps": jumps, "danger": danger,
         "defaults": {"tax": DEF_TAX, "broker": DEF_BROKER, "freight": DEF_FREIGHT,
                      "cargo": DEF_CARGO, "days": DEF_DAYS, "min_vol": DEF_MIN_VOL},
         "rows": rows,

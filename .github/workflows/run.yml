@@ -35,7 +35,7 @@ jobs:
         run: |
           git config user.name  "eve-ops-bot"
           git config user.email "eve-ops-bot@users.noreply.github.com"
-          for f in ids_cache.json vol_cache.json routes_cache.json hist_cache.json; do [ -f "$f" ] && git add -f "$f"; done
+          for f in ids_cache.json vol_cache.json routes_cache.json hist_cache.json danger_cache.json sys_cache.json; do [ -f "$f" ] && git add -f "$f"; done
           if ! git diff --cached --quiet; then
             git commit -m "state: $(date -u +%FT%TZ)"
             pushed=0; for i in 1 2 3 4 5; do if git push; then pushed=1; break; fi; git pull --rebase; sleep $((RANDOM % 4 + 2)); done
