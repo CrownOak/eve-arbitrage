@@ -373,7 +373,7 @@ def build_rows(ids_by_name, vols):
     for tid in ids:
         s = str(tid)
         name = name_by_id.get(tid)
-        sells, raw_min, buys, sellvol, buyvol, swavg, bwavg = {}, {}, {}, {}, {}, {}, {}
+        sells, raw_min, buys, sellvol = {}, {}, {}, {}
         for hub in live_hubs:
             agg = px[hub].get(s)
             if not agg:
@@ -385,12 +385,9 @@ def build_rows(ids_by_name, vols):
                 sells[hub] = rs
                 raw_min[hub] = _f(sell.get("min"))
                 sellvol[hub] = _f(sell.get("volume"))
-                swavg[hub] = _f(sell.get("weightedAverage")) or rs   # bulk-realistic buy-from price
             rb = robust_buy(buy)
             if rb > 0:
                 buys[hub] = rb
-                buyvol[hub] = _f(buy.get("volume"))
-                bwavg[hub] = _f(buy.get("weightedAverage")) or rb     # bulk-realistic sell-into price
         if len(sells) < 2:                       # need 2+ hubs to arbitrage
             continue
         buy_hub = min(sells, key=sells.get)      # acquire cheapest
@@ -413,12 +410,10 @@ def build_rows(ids_by_name, vols):
             "fh": flip_hub, "fp": flip_price,
             "lh": list_hub, "lp": list_price,
             "m3": vols.get(tid), "vol": int(sellvol.get(buy_hub, 0)), "thin": thin,
-            # per-hub VWA prices + order-book volumes (in HUBS order) for the Load Optimizer.
-            # Sweeping the book up to its listed volume costs ~the VWA, so VWA + volume cap is honest.
-            "sxw": [round(swavg[h], 2) if h in swavg else None for h, _ in HUBS],
-            "bxw": [round(bwavg[h], 2) if h in bwavg else None for h, _ in HUBS],
-            "sv": [int(sellvol.get(h, 0)) for h, _ in HUBS],
-            "bv": [int(buyvol.get(h, 0)) for h, _ in HUBS],
+            # per-hub robust 5% prices (in HUBS order) for the Load Optimizer; quantities are capped
+            # by daily traded volume (dvx) so the percentile holds for the load. Fat-finger resistant.
+            "sxp": [round(sells[h], 2) if h in sells else None for h, _ in HUBS],
+            "bxp": [round(buys[h], 2) if h in buys else None for h, _ in HUBS],
         })
     rows.sort(key=lambda r: r["n"].lower())
     return rows, live_hubs
@@ -637,7 +632,7 @@ def esi_daily_volume(tid, region, days=HIST_DAYS):
     return 0
 
 
-def daily_volumes(pairs, refresh=False, max_days=2):
+def daily_volumes(pairs, refresh=False, max_days=7):
     """{(tid, region): avg_daily_units} for the requested (type, region) pairs. Cached ~2 days
     (traded volume moves slowly), so a normal hourly run hits the cache and skips ESI history."""
     cache = {}
@@ -748,11 +743,9 @@ def main():
         tid = ids_by_name.get(r["n"])
         if tid is None:
             continue
-        if r.get("lh"):
-            pairs.add((tid, hub_region[r["lh"]]))
-        if r.get("fh"):
-            pairs.add((tid, hub_region[r["fh"]]))
-    print(f"  Fetching destination daily volume for {len(pairs)} (item, hub) pairs...")
+        for _, region in HUBS:          # all hubs: the Load Optimizer caps any origin->dest by daily volume
+            pairs.add((tid, region))
+    print(f"  Fetching daily volume for {len(pairs)} (item, hub) pairs across all hubs...")
     try:
         dv = daily_volumes(pairs, refresh=args.refresh)
     except Exception as e:
@@ -762,6 +755,7 @@ def main():
         tid = ids_by_name.get(r["n"])
         r["ldv"] = dv.get((tid, hub_region.get(r["lh"])), 0) if r.get("lh") else 0
         r["fdv"] = (dv.get((tid, hub_region.get(r["fh"])), 0) if r.get("fh") else None)
+        r["dvx"] = [dv.get((tid, region), 0) for _, region in HUBS]   # daily traded volume per hub
 
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
