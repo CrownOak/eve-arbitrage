@@ -23,11 +23,18 @@ def render_page(data):
     d = data.get("defaults") or {}
     rows = data.get("rows") or []
     blob = json.dumps({"rows": rows, "defaults": d, "jumps": data.get("jumps") or {},
-                       "danger": data.get("danger") or {}})
+                       "danger": data.get("danger") or {}, "H": data.get("H") or []})
     if not rows:
         inner = '<div class="empty">No data yet. The hourly run will populate this page.</div>'
     else:
         inner = """
+    <div class="rctl" style="margin-bottom:14px">
+      <div class="toggle">View
+        <button id="vSpreads" class="on">Spreads</button>
+        <button id="vLoad">Load Optimizer</button>
+      </div>
+    </div>
+    <div id="spreadsView">
     <div class="rctl">
       <label class="rlab">Search <input id="q" type="text" placeholder="item name..." autocomplete="off"></label>
       <label class="rlab" data-tip="Sales tax paid on every market sale. Set it to your Accounting skill level.">Sales tax %
@@ -70,6 +77,17 @@ def render_page(data):
       <th data-sort="iskjump" data-tip="The headline: net ISK per jump for the cargo you can realistically move, after fees and freight. The haul is capped at your hold AND at the days of volume the destination actually trades, so thin markets cannot inflate it. Travel is the job, so this ranks routes by what each jump pays.">ISK / JUMP</th>
       <th data-sort="dvol"   data-tip="Average units actually TRADED per day at the sell hub (ESI market history). The real cap on how much one haul can move, not an order book snapshot.">DAY VOL</th>
     </tr></thead><tbody id="tb"></tbody></table>
+    </div>
+    <div id="loadView" style="display:none">
+    <div class="rctl">
+      <label class="rlab">From <select id="loOrig"></select></label>
+      <label class="rlab">To <select id="loDest"></select></label>
+      <label class="rlab" data-tip="How much cargo you fill, in cubic metres. A jump freighter is about 60000.">Cargo m&sup3; <input id="loCargo" type="number" value="60000" min="1" step="1000"></label>
+      <div class="toggle">Model <button id="loList" class="on">List</button><button id="loFlip">Flip</button></div>
+      <button id="loGo" class="gobtn" style="padding:8px 20px">Optimize</button>
+    </div>
+    <div id="loOut"><div class="empty" style="padding:20px">Pick a route and cargo, then Optimize. Jumps and danger use the Highsec route.</div></div>
+    </div>
 """
     sub = (f"buy low in one hub, sell high in another &middot; ranked by ISK per jump, because travel is the job "
            f"&middot; {n} items across {len(data.get('hubs') or [])} hubs ({_esc(hubs)}) "
@@ -93,6 +111,13 @@ def render_page(data):
   .dgr{{ display:inline-block; font-family:var(--mono); font-size:10px; font-weight:700; text-transform:uppercase;
          letter-spacing:.05em; padding:2px 8px; border:1px solid currentColor; cursor:help; }}
   .dgr.good{{ color:var(--ore); }} .dgr.warn{{ color:var(--amber); }} .dgr.bad{{ color:var(--red); }}
+  select{{ padding:6px 9px; background:var(--black); border:1px solid var(--line); color:var(--silver); font-family:var(--mono); font-size:12px; }}
+  .mchips{{ display:flex; flex-wrap:wrap; gap:10px; margin:6px 0 16px; }}
+  .mchip{{ font-family:var(--mono); font-size:12px; color:var(--silver-dim); border:1px solid var(--line); padding:7px 12px; }}
+  .mchip b{{ color:var(--silver); }} .mchip.cheap{{ border-color:var(--ore); color:var(--ore); }} .mchip.cheap b{{ color:var(--ore); }}
+  table tr.mtot td{{ border-top:2px solid var(--line); }}
+  .mfoot{{ display:flex; gap:16px; align-items:center; margin-top:14px; font-family:var(--mono); font-size:12px; color:var(--muted); flex-wrap:wrap; }}
+  .mfoot b{{ color:var(--silver); }}
 </style></head>
 <body>
   <header>
@@ -129,7 +154,7 @@ def render_page(data):
   var st = {{ tax:DF.tax!=null?DF.tax:3.37, broker:DF.broker!=null?DF.broker:3.0,
              freight:DF.freight||0, cargo:DF.cargo||60000, days:DF.days!=null?DF.days:1,
              minvol:DF.min_vol!=null?DF.min_vol:100,
-             model:"list", flag:"secure", q:"", all:false, key:"iskjump", dir:-1 }};
+             model:"list", loModel:"list", flag:"secure", q:"", all:false, key:"iskjump", dir:-1 }};
   function isk(v){{ if(v==null) return "n/a"; var a=Math.abs(v);
     if(a>=1e9) return (v/1e9).toFixed(2)+"B"; if(a>=1e6) return (v/1e6).toFixed(2)+"M";
     if(a>=1e3) return (v/1e3).toFixed(1)+"k"; if(a>=1) return String(Math.round(v));
@@ -224,6 +249,78 @@ def render_page(data):
   pair("mList","mFlip",function(first){{ st.model=first?"list":"flip"; }});
   pair("rSec","rShort",function(first){{ st.flag=first?"secure":"shortest"; }});
   pair("tProfit","tAll",function(first){{ st.all=!first; }});
+
+  // ---- Load Optimizer: greedy fractional knapsack on profit/m3, VWA priced, capped by daily traded volume ----
+  var H = DATA.H || [];
+  function copyText(t){{ try{{ if(navigator.clipboard&&navigator.clipboard.writeText){{ navigator.clipboard.writeText(t); return; }} }}catch(e){{}}
+    var ta=document.createElement("textarea"); ta.value=t; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.focus(); ta.select(); try{{document.execCommand("copy");}}catch(_){{}} document.body.removeChild(ta); }}
+  function fillHubs(id, def){{ var s=document.getElementById(id); if(!s) return;
+    s.innerHTML=H.map(function(h){{ return "<option"+(h===def?" selected":"")+">"+h+"</option>"; }}).join(""); }}
+  fillHubs("loOrig", H[0]); fillHubs("loDest", H.length>3?H[3]:H[1]);
+  function optimize(){{
+    var origin=document.getElementById("loOrig").value, dest=document.getElementById("loDest").value;
+    var cargo=parseFloat(document.getElementById("loCargo").value)||0;
+    var oi=H.indexOf(origin), di=H.indexOf(dest), out=document.getElementById("loOut");
+    if(oi<0||di<0||oi===di){{ out.innerHTML="<div class='empty' style='padding:20px'>Pick two different hubs.</div>"; return; }}
+    var tax=st.tax/100, broker=st.broker/100, days=st.days||1, model=st.loModel, cands=[];
+    D.forEach(function(r){{
+      if(!(r.m3>0)) return;
+      var sxw=r.sxw||[], bxw=r.bxw||[], dvx=r.dvx||[];
+      var buy=sxw[oi]; if(buy==null) return;
+      var sell, fee;
+      if(model==="flip"){{ sell=bxw[di]; fee=tax; }} else {{ sell=sxw[di]; fee=tax+broker; }}
+      if(sell==null) return;
+      var net=sell*(1-fee), pu=net-buy;
+      if(pu<=0) return;
+      var cap=Math.floor(days*Math.min(dvx[oi]||0, dvx[di]||0));   // honest absorbable quantity
+      if(cap<1) return;
+      cands.push({{n:r.n, m3:r.m3, buy:buy, pu:pu, perM3:pu/r.m3, cap:cap}});
+    }});
+    cands.sort(function(a,b){{ return b.perM3-a.perM3; }});
+    var load=[], left=cargo, totCost=0, totProfit=0;
+    cands.forEach(function(c){{
+      if(left<c.m3) return;
+      var q=Math.min(Math.floor(left/c.m3), c.cap);
+      if(q<1) return;
+      left-=q*c.m3; totCost+=q*c.buy; totProfit+=q*c.pu;
+      load.push({{n:c.n, q:q, m3:q*c.m3, cost:q*c.buy, profit:q*c.pu, perM3:c.perM3}});
+    }});
+    renderLoad(origin, dest, cargo, left, load, totCost, totProfit);
+  }}
+  function renderLoad(origin,dest,cargo,left,load,totCost,totProfit){{
+    var out=document.getElementById("loOut");
+    if(!load.length){{ out.innerHTML="<div class='empty' style='padding:20px'>No profitable "+st.loModel+" load from "+origin+" to "+dest+" right now.</div>"; return; }}
+    var jumps=jumpsOf(origin,dest), dg=dangerOf(origin,dest), used=cargo-left;
+    var ppj=(jumps&&jumps>0)?totProfit/jumps:null;
+    var dgh=dg?("<span class='dgr "+(dg.band==="deadly"?"bad":(dg.band==="risky"?"warn":"good"))+"' data-tip='"+esc(dtip(dg))+"'>"+dg.band+"</span>"):"n/a";
+    var h="<div class='mchips'>";
+    h+="<span class='mchip cheap'>Est. profit <b>"+isk(totProfit)+"</b></span>";
+    h+="<span class='mchip'>Cost <b>"+isk(totCost)+"</b></span>";
+    h+="<span class='mchip'>Profit/jump <b>"+(ppj==null?"n/a":isk(ppj))+"</b></span>";
+    h+="<span class='mchip'>Cargo <b>"+qty(Math.round(used))+" / "+qty(cargo)+"</b> m&sup3;</span>";
+    h+="<span class='mchip'>Jumps <b>"+(jumps==null?"n/a":jumps)+"</b></span>";
+    h+="<span class='mchip'>Danger "+dgh+"</span></div>";
+    h+="<table><thead><tr><th class='who'>ITEM</th><th>QTY</th><th>m&sup3;</th><th>BUY COST</th><th>EST PROFIT</th><th>ISK/m&sup3;</th></tr></thead><tbody>";
+    load.forEach(function(l){{ h+="<tr><td class='who'><span class='strong'>"+esc(l.n)+"</span></td><td class='num'>"+qty(l.q)+"</td><td class='num'>"+qty(Math.round(l.m3))+"</td><td class='num'>"+isk(l.cost)+"</td><td class='num strong good'>"+isk(l.profit)+"</td><td class='num'>"+isk(l.perM3)+"</td></tr>"; }});
+    h+="<tr class='mtot'><td class='who strong'>TOTAL</td><td></td><td class='num'>"+qty(Math.round(used))+"</td><td class='num strong'>"+isk(totCost)+"</td><td class='num strong good'>"+isk(totProfit)+"</td><td></td></tr></tbody></table>";
+    h+="<div class='mfoot'><button id='loCopy' class='link'>copy origin multibuy</button><span>buy at "+origin+", haul to "+dest+", "+(st.loModel==="flip"?"dump into buy orders":"relist under the market")+". Prices are volume weighted and capped at a day of traded volume, so it is realistic, but order depth is not modeled. Estimate, not a promise.</span></div>";
+    out.innerHTML=h;
+    var cb=document.getElementById("loCopy");
+    if(cb) cb.onclick=function(){{ copyText(load.map(function(l){{ return l.n+" "+l.q; }}).join("\\n"));
+      cb.textContent="copied"; setTimeout(function(){{ cb.textContent="copy origin multibuy"; }},2000); }};
+  }}
+  (function(){{ var a=document.getElementById("loList"), b=document.getElementById("loFlip");
+    function hasResult(){{ return !!document.getElementById("loOut").querySelector("table"); }}
+    a.onclick=function(){{ st.loModel="list"; a.classList.add("on"); b.classList.remove("on"); if(hasResult()) optimize(); }};
+    b.onclick=function(){{ st.loModel="flip"; b.classList.add("on"); a.classList.remove("on"); if(hasResult()) optimize(); }};
+    document.getElementById("loGo").onclick=optimize;
+    var vs=document.getElementById("vSpreads"), vl=document.getElementById("vLoad"),
+        sv=document.getElementById("spreadsView"), lv=document.getElementById("loadView");
+    vs.onclick=function(){{ vs.classList.add("on"); vl.classList.remove("on"); sv.style.display=""; lv.style.display="none"; }};
+    vl.onclick=function(){{ vl.classList.add("on"); vs.classList.remove("on"); sv.style.display="none"; lv.style.display=""; }};
+  }})();
+
   render();
 }})();
 </script>
