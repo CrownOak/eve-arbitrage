@@ -79,7 +79,7 @@ def render_page(data):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="{REFRESH_SECONDS}">
 <title>BONK - Hub Arbitrage</title>
-<link rel="stylesheet" href="https://crownoak.github.io/wdeve/common.css?v=3">
+<link rel="stylesheet" href="/common.css?v=3">
 <style>
   .rctl{{ display:flex; flex-wrap:wrap; align-items:center; gap:20px; margin:2px 0 16px; }}
   .rlab{{ display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:11px;
@@ -227,7 +227,7 @@ def render_page(data):
   render();
 }})();
 </script>
-<script src="https://crownoak.github.io/wdeve/nav.js"></script>
+<script src="/nav.js?v=2"></script>
 </body></html>"""
 
 
