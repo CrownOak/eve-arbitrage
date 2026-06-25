@@ -263,17 +263,18 @@ def render_page(data):
     var cargo=parseFloat(document.getElementById("loCargo").value)||0;
     var oi=H.indexOf(origin), di=H.indexOf(dest), out=document.getElementById("loOut");
     if(oi<0||di<0||oi===di){{ out.innerHTML="<div class='empty' style='padding:20px'>Pick two different hubs.</div>"; return; }}
-    var tax=st.tax/100, broker=st.broker/100, days=st.days||1, model=st.loModel, cands=[];
+    var tax=st.tax/100, broker=st.broker/100, model=st.loModel, cands=[];
     D.forEach(function(r){{
       if(!(r.m3>0)) return;
-      var sxw=r.sxw||[], bxw=r.bxw||[], dvx=r.dvx||[];
+      var sxw=r.sxw||[], bxw=r.bxw||[], sv=r.sv||[], bv=r.bv||[];
       var buy=sxw[oi]; if(buy==null) return;
-      var sell, fee;
-      if(model==="flip"){{ sell=bxw[di]; fee=tax; }} else {{ sell=sxw[di]; fee=tax+broker; }}
+      var sell, fee, cap;
+      if(model==="flip"){{ sell=bxw[di]; fee=tax; cap=Math.min(sv[oi]||0, bv[di]||0); }}  // sweep origin sell book into dest buy book
+      else {{ sell=sxw[di]; fee=tax+broker; cap=sv[oi]||0; }}                               // buy at origin, relist at dest
       if(sell==null) return;
       var net=sell*(1-fee), pu=net-buy;
       if(pu<=0) return;
-      var cap=Math.floor(days*Math.min(dvx[oi]||0, dvx[di]||0));   // honest absorbable quantity
+      cap=Math.floor(cap);
       if(cap<1) return;
       cands.push({{n:r.n, m3:r.m3, buy:buy, pu:pu, perM3:pu/r.m3, cap:cap}});
     }});
@@ -304,7 +305,7 @@ def render_page(data):
     h+="<table><thead><tr><th class='who'>ITEM</th><th>QTY</th><th>m&sup3;</th><th>BUY COST</th><th>EST PROFIT</th><th>ISK/m&sup3;</th></tr></thead><tbody>";
     load.forEach(function(l){{ h+="<tr><td class='who'><span class='strong'>"+esc(l.n)+"</span></td><td class='num'>"+qty(l.q)+"</td><td class='num'>"+qty(Math.round(l.m3))+"</td><td class='num'>"+isk(l.cost)+"</td><td class='num strong good'>"+isk(l.profit)+"</td><td class='num'>"+isk(l.perM3)+"</td></tr>"; }});
     h+="<tr class='mtot'><td class='who strong'>TOTAL</td><td></td><td class='num'>"+qty(Math.round(used))+"</td><td class='num strong'>"+isk(totCost)+"</td><td class='num strong good'>"+isk(totProfit)+"</td><td></td></tr></tbody></table>";
-    h+="<div class='mfoot'><button id='loCopy' class='link'>copy origin multibuy</button><span>buy at "+origin+", haul to "+dest+", "+(st.loModel==="flip"?"dump into buy orders":"relist under the market")+". Prices are volume weighted and capped at a day of traded volume, so it is realistic, but order depth is not modeled. Estimate, not a promise.</span></div>";
+    h+="<div class='mfoot'><button id='loCopy' class='link'>copy origin multibuy</button><span>buy at "+origin+", haul to "+dest+", "+(st.loModel==="flip"?"dump into buy orders":"relist under the market")+". Prices are the volume-weighted average, capped at what is on the order book, so sweeping it pays about this. A big haul still moves the market. Estimate, not a promise.</span></div>";
     out.innerHTML=h;
     var cb=document.getElementById("loCopy");
     if(cb) cb.onclick=function(){{ copyText(load.map(function(l){{ return l.n+" "+l.q; }}).join("\\n"));

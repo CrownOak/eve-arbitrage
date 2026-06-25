@@ -373,7 +373,7 @@ def build_rows(ids_by_name, vols):
     for tid in ids:
         s = str(tid)
         name = name_by_id.get(tid)
-        sells, raw_min, buys, sellvol, swavg, bwavg = {}, {}, {}, {}, {}, {}
+        sells, raw_min, buys, sellvol, buyvol, swavg, bwavg = {}, {}, {}, {}, {}, {}, {}
         for hub in live_hubs:
             agg = px[hub].get(s)
             if not agg:
@@ -389,6 +389,7 @@ def build_rows(ids_by_name, vols):
             rb = robust_buy(buy)
             if rb > 0:
                 buys[hub] = rb
+                buyvol[hub] = _f(buy.get("volume"))
                 bwavg[hub] = _f(buy.get("weightedAverage")) or rb     # bulk-realistic sell-into price
         if len(sells) < 2:                       # need 2+ hubs to arbitrage
             continue
@@ -412,9 +413,12 @@ def build_rows(ids_by_name, vols):
             "fh": flip_hub, "fp": flip_price,
             "lh": list_hub, "lp": list_price,
             "m3": vols.get(tid), "vol": int(sellvol.get(buy_hub, 0)), "thin": thin,
-            # per-hub volume-weighted-average prices (in HUBS order) for the Load Optimizer
+            # per-hub VWA prices + order-book volumes (in HUBS order) for the Load Optimizer.
+            # Sweeping the book up to its listed volume costs ~the VWA, so VWA + volume cap is honest.
             "sxw": [round(swavg[h], 2) if h in swavg else None for h, _ in HUBS],
             "bxw": [round(bwavg[h], 2) if h in bwavg else None for h, _ in HUBS],
+            "sv": [int(sellvol.get(h, 0)) for h, _ in HUBS],
+            "bv": [int(buyvol.get(h, 0)) for h, _ in HUBS],
         })
     rows.sort(key=lambda r: r["n"].lower())
     return rows, live_hubs
@@ -744,9 +748,11 @@ def main():
         tid = ids_by_name.get(r["n"])
         if tid is None:
             continue
-        for _, region in HUBS:          # all hubs now: the Load Optimizer caps any origin->dest by daily volume
-            pairs.add((tid, region))
-    print(f"  Fetching daily volume for {len(pairs)} (item, hub) pairs across all hubs...")
+        if r.get("lh"):
+            pairs.add((tid, hub_region[r["lh"]]))
+        if r.get("fh"):
+            pairs.add((tid, hub_region[r["fh"]]))
+    print(f"  Fetching destination daily volume for {len(pairs)} (item, hub) pairs...")
     try:
         dv = daily_volumes(pairs, refresh=args.refresh)
     except Exception as e:
@@ -756,7 +762,6 @@ def main():
         tid = ids_by_name.get(r["n"])
         r["ldv"] = dv.get((tid, hub_region.get(r["lh"])), 0) if r.get("lh") else 0
         r["fdv"] = (dv.get((tid, hub_region.get(r["fh"])), 0) if r.get("fh") else None)
-        r["dvx"] = [dv.get((tid, region), 0) for _, region in HUBS]   # daily traded volume per hub
 
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
